@@ -1,0 +1,16 @@
+[32m[1m[INFO][0m[0m[1m [OfflineReplayer][0m: Enable 5G_NR_L2_UL_BSR
+[32m[1m[INFO][0m[0m[1m [OfflineReplayer][0m: STARTED: 1785742111.433436
+[32m[1m[INFO][0m[0m[1m [OfflineReplayer][0m: Loading /tmp/mon_20260803/udp_overload.mi2log
+[32m[1m[INFO][0m[0m[1m [OfflineReplayer][0m: Loading: 1785742111.43349
+[32m[1m[INFO][0m[0m[1m [OfflineReplayer][0m: Decoding_inter: 0.0008246898651123047
+[32m[1m[INFO][0m[0m[1m [OfflineReplayer][0m: sending_inter: 0.019454240798950195
+[32m[1m[INFO][0m[0m[1m [OfflineReplayer][0m: Offline replay is completed.
+wrote 3390
+[32m[1m[INFO][0m[0m[1m [OfflineReplayer][0m: Enable 5G_NR_MAC_UL_Physical_Channel_Schedule_Report
+[32m[1m[INFO][0m[0m[1m [OfflineReplayer][0m: STARTED: 1785742111.6201234
+[32m[1m[INFO][0m[0m[1m [OfflineReplayer][0m: Loading /tmp/mon_20260803/udp_overload.mi2log
+[32m[1m[INFO][0m[0m[1m [OfflineReplayer][0m: Loading: 1785742111.6201582
+[32m[1m[INFO][0m[0m[1m [OfflineReplayer][0m: Decoding_inter: 0.027949810028076172
+[32m[1m[INFO][0m[0m[1m [OfflineReplayer][0m: sending_inter: 0.20262694358825684
+[32m[1m[INFO][0m[0m[1m [OfflineReplayer][0m: Offline replay is completed.
+total: 10608

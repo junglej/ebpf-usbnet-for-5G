@@ -84,7 +84,7 @@ driver dwell 分布里。
 | driver in-flight | 顶格 ~64 包(p50=40),6.8 usbnet 上限 |
 | driver dwell | p50=2.41 ms,p90=177 ms,p99=190 ms(双峰) |
 | driver 消费速率 vs 模组空口速率 | **R=0.964**;字节闭环 air/DEQ=1.015 |
-| UE BSR(两端) | 97% 顶格 31(>150 KB),空闲为 0;中间值只在过渡瞬间 |
+| UE BSR(两端) | 97% 顶格 31(=报告值 >150 KB 的量化上桶),空闲为 0;中间值只在过渡瞬间 |
 | 模组内部缓冲深度 | RTT(~850 ms)− driver dwell(~190 ms)⇒ 模组内部还压着数百毫秒 |
 
 **(c) 队列各层(不超容量工况 `data/aligned.*`)**:dwell p50=0.09 ms、
@@ -142,17 +142,84 @@ RM500Q 上两段的"容积比"和论文测试的 USB 模组(浅缓冲)不同。
   (driver dwell 是空口排队下界,论文 USB 模组是浅缓冲近似相等)。
   两者都不动摇 dwell 作为信号的有效性,但影响用它做定量估计的方式。
 
-**标准数据集**(`data/`,采集窗口已对齐:DIAG 68 s ⊇ txdwell 60 s):
+**标准数据集**(`data/`,采集窗口已对齐:DIAG 58 s ⊇ txdwell 50 s。
+**流量全部由 iperf3 3.19.1 产生**(udp_seq_sender.py 是 gNB 底层
+UL_PKT 分析专用,不用于本复现):
 
-- `aligned.*` — 低于容量(供给 ~9 Mbps < 空口 ~10 Mbps):队列全
-  程很薄(dwell ~1–3 ms、in-flight≈0),BSR 在 24–31 跟随,R=0.943。
-- `overload.*` — 超容量(双发 ~14 Mbps):BSR 两端顶格 31、
-  in-flight 顶格 64、dwell 150–200 ms 带、结束各层同步排空,
-  **R=0.964**,air/DEQ=1.015。
+- `aligned.*` — `iperf3 -u -b 8M -t 30`(低于容量):实测 8.00 Mbps
+  0% 丢包;driver 队列全程为零(dwell≈0、in-flight≈0),**BSR 稳定在
+  ~22–23 的中间水位**(两端一致,健康稳态的样本),
+  **R=1.000**,air/DEQ=1.015。
+- `overload.*` — `iperf3 -u -b 20M -w 64M -t 30`(超容量;需先把
+  robot 的 `net.core.wmem_max` 调到 128 MB,否则 SNDBUF 背压把发送端
+  限在 ~9.7 Mbps 堆不出过载):实测供给 20.0 Mbps、接收 11.0 Mbps、
+  **41% 丢包**;BSR 两端顶格 31、in-flight 顶格 64、dwell 170–200 ms
+  带、driver 消费速率绕空口速率锯齿波动,停压各层同步排空,
+  R=0.909,air/DEQ=1.011。
 - 队列填充的因果链(过载每次复现):加压 → **UE BSR 先动**(0xB873
   触发 HIGH_DATA_ARRIVAL,~1 s 内 0→31)→ gNB 见 bs=31 → **USB 流控
   反压,driver 队列顶满**(in-flight→64)→ dwell 抬升 → 空口顶到
   容量平台 → 停压各层一起排空。
+
+## TDD 时隙配比实验(2026-08-02,DL:UL 6:3 → 2:7)
+
+把 docker gNB 的 `tdd_ul_dl_cfg` 从 6DL:3UL 改为 **2DL:7UL**(备份:
+`configs/gnb_rf_x310_tdd_n78_20mhz_docker.yml.bak_6d3u`)。注意:严格的
+1:8 被配置校验拒绝(CSI-RS 要求 ≥2 个起始 DL 时隙,或 1 DL + 特殊时隙
+9 DL 符号 + dmrs-AdditionalPosition=2),2:7 是合法的最接近值。
+
+| 指标 | 6DL:3UL(原) | 2DL:7UL(新) | 变化 |
+|---|---|---|---|
+| UDP 上行容量 | ~9–10.5 Mbps | **~16.6 Mbps**(2024 pkt/s × 1028 B,~40 Mbps 冲击下平台+30% 丢包) | ×1.65 |
+| TCP 上行(单流) | 3.0–5.1 Mbps | **12.4 Mbps**(接收端 11.0) | ×2.4–4 |
+| TCP 上行(4 流) | — | 12.6 Mbps(与单流持平,单流已饱) | — |
+| TCP 下 driver 队列 | 过载时顶格(64) | **依旧很薄**:dwell p50=0.17 ms、in-flight ~3(TCP 自限在容量 75% 处) | — |
+| iperf3 UDP 模式 | 控制信道在 UE→容器路径上必崩 | **已根治**:5gc 容器 ogstun 有多个 /16 地址,UDP 回包源地址被路由选成 10.45.0.1,connected UDP 客户端丢弃非对端回包;修复见下 | — |
+
+**iperf3 UDP 故障根治(2026-08-02)**:tcpdump(nsenter 进容器 netns)抓到
+服务端 UDP 回包源地址为 `10.45.0.1` 而非 `10.45.1.1`,iperf3 UDP 客户端
+(connected socket)直接丢弃。修复落在 ocudu 仓库:
+`docker/open5gs/routes_ue_src.py`(为每个 /24 加 prefsrc 路由)+
+`open5gs_entrypoint.sh` 尾部延迟 8s 调用(UPF 启动会刷 ogstun 路由)+
+Dockerfile COPY。已重建 5gc 镜像并全量重部署验证(`ip route get
+10.45.1.2 → src 10.45.1.1`)。修复后 iperf3 全功能可用:
+UDP 10M → 8.34 Mbps(0% 丢包),TCP UL 7.69/6.11 Mbps,
+TCP DL(-R) 26.1/24.6 Mbps(6DL:3UL,2026-08-02)。
+`使用说明.md` §4.1 已同步记录。
+
+结论:UL 时隙从 30% 提到 70%,空口 UL 容量 ~×1.65;TCP 因拥塞控制
+自限在容量以下,吃到了比容量比例更大的提升;12 Mbps 的 TCP 仍不足以
+让 driver 队列堆积——要复现过载形态需 ~17 Mbps 以上持续供给。
+iperf3 UDP 控制信道在空口路径上始终报 `unable to read from stream
+socket`(host→容器直连正常),原因未查明,UDP 容量测试请用
+`udp_seq_sender.py` 多路并发 + 容器内 `udp_seq_server.py`。
+
+## TCP 为什么低于 UDP:bufferbloat 实测分解(2026-08-03,tcp1 数据集)
+
+同一小区同一时刻:UDP 上行 ~9.7 Mbps(SNDBUF 背压限速),TCP 上行
+7.59 Mbps。用三源仪器完整分解(eBPF + DIAG + ss):
+
+- **driver 层零排队**:driver dwell 全程 0.1–0.2 ms,in-flight ≈0——
+  TCP 的包被模组瞬时收走,usbnet 不积压。
+- **模组内部持续深排队**:0xB873 BSR 97% 顶格 31。注意 Short BSR 是
+  量化桶,31 只表示 **>150 KB**,不代表模组缓冲已达物理上限(其绝对
+  容量未知);但 RTT(~500–640 ms)× 吞吐(~7.6 Mbps)反推全链路在飞
+  ~0.5 MB,与模组侧深排队自洽。BSR 值的"开关式"分布(只有 0 和 31,
+  中间值仅出现在过渡瞬间)是 work-conserving 深队列特征。
+- **RTT 膨胀**:ss 采样 RTT 从 ~150 ms 涨到 ~500–640 ms;cwnd
+  108→488 钉住;unacked ~370 段 ≈ 500 KB;delivery_rate ~5.4–7.7 Mbps,
+  pacing_rate ~12 Mbps。
+- **空口重传升高**:0xB883 逐 TB retx 占比 9.8 %(UDP 洪泛实验 3.4 %)。
+
+结论:TCP 吞吐 ≈ 在飞字节/RTT ≈ 500 KB / 0.5 s ≈ 8 Mbps——**不是空口
+变差,是深缓冲把 RTT 吹大、TCP 被自己的反馈环限住**(再加 pacing 与
+偶发丢包 ssthresh=30)。这正是 Aether 针对的 bufferbloat 场景。
+
+**对论文模型的边界发现**:亚容量 TCP 负载下 driver dwell(0.1 ms)对
+模组内部 150 KB 积压完全无感——USB 流控要等模组队列更深(~190 ms
+dwell 带)才启用。即"driver 队列≡模组队列"在这颗 RM500Q 上只在
+**饱和点以上**成立;要让 Aether 的瓶颈检测在此类深缓冲 USB 模组上
+工作,信号应改用 BSR(0xB873 实时可得)或快路径 dwell 统计。
 
 ## RM500Q USB 稳定性
 
@@ -186,6 +253,9 @@ AT+CFUN=1,1                 # 重启模组生效;回退: "30" + 同样重启
 - `scripts/record.sh` — 定时录制 CSV。
 - `scripts/plot.py` — dwell + in-flight 曲线(Fig. 4a 风格)。
 - `scripts/decode_b883.py` — 0xB883 v2.11 Raw Hex → 逐 PUSCH TB CSV。
+- `scripts/plot_aligned.py` — 四面板对齐图(dwell / in-flight / 双速率 /
+  双端 BSR),参数化数据集名,例如
+  `python3 scripts/plot_aligned.py overload --off <offset>`。
 - `data/` — 标准对齐数据集(`aligned.*`、`overload.*`)。
 - robot 侧采集/分析脚本在 robot 仓库
   `~/Documents/mobileinsight-core/bsr_exp/`(capture_ue_bsr.py、
@@ -210,8 +280,10 @@ AT+CFUN=1,1                 # 重启模组生效;回退: "30" + 同样重启
      ~/Documents/mobileinsight-core/bsr_exp/capture_ue_bsr.py \
      /dev/ttyUSB0 115200 /tmp/run.mi2log
    ```
-   发压用 `~/Documents/udp_seq_sender.py`(iperf3 3.9 在此环境每测必
-   崩;如需 iperf3 用编好的 3.19.1 静态版)。
+   发压用 iperf3 3.19.1(robot `~/Documents/iperf3.new`,server 在
+   5gc 容器):不超容量 `iperf3 -u -b 8M -t 30`;超容量先
+   `sudo sysctl -w net.core.wmem_max=134217728`(运行时生效,重启失效)
+   再 `iperf3 -u -b 20M -w 64M -t 30`。
 5. 分析:robot 上用 `bsr_exp/` 的提取脚本出 UE BSR / 0xB883 raw;
    本地 `scripts/decode_b883.py` 解逐 TB 事件,`scripts/plot.py`
    或对齐出图脚本出曲线;时钟偏移在 robot 上

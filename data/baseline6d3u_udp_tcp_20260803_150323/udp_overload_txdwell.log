@@ -1,0 +1,6 @@
+[sudo] password for robot: usbnet_start_xmit [usbnet] @ 0xffffffffc1e2ec30
+tx_complete        [usbnet] @ 0xffffffffc1e2f390
+attached usbnet_start_xmit        @ 0xffffffffc1e2ec30
+attached tx_complete              @ 0xffffffffc1e2f390
+observing filtered interface, ENQ events off, output /tmp/mon_20260803/udp_overload.csv
+summary: enq=29905 deq=29905 miss=0 insert_fail=0 rb_lost=0 inflight=0 pkts/0 bytes

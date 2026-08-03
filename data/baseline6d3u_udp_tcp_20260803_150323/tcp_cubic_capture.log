@@ -1,0 +1,4 @@
+[32m[1m[INFO][0m[0m[1m [OnlineMonitor][0m: Enable collection: 5G_NR_L2_UL_BSR
+[32m[1m[INFO][0m[0m[1m [OnlineMonitor][0m: Enable collection: 5G_NR_MAC_UL_Physical_Channel_Schedule_Report
+[32m[1m[INFO][0m[0m[1m [OnlineMonitor][0m: Enable collection: 5G_NR_MAC_UL_TB_Stats
+[32m[1m[INFO][0m[0m[1m [OnlineMonitor][0m: Enable collection: 5G_NR_LL1_FW_Serving_FTL
