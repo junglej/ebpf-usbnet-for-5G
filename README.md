@@ -1,309 +1,231 @@
-# txdwell — usbnet TX queue dwell-time / queue-length observer
+# txdwell — Aether 论文 driver-queue 观测在 RM500Q 上的复现
 
-eBPF (CO-RE) tool reproducing the core observation of **Aether (SIGCOMM'26)**:
-for a USB cellular modem driven by `usbnet` (Quectel RM500Q / `qmi_wwan`),
-measure the **driver-level TX queue dwell time** and **queue length**
-(in-flight packets) as an uplink congestion signal.
+用 eBPF(CO-RE)在 **Quectel RM500Q-GL**(usbnet/qmi_wwan)上复现
+**Aether (SIGCOMM'26,《Forewarned is Forearmed》)** 的核心观测:
+**driver 层 TX 队列的 per-packet dwell time 与队列长度是上行拥塞的
+即时信号,且 driver 队列与模组空口缓冲构成"单一逻辑队列"**。
+并用 MobileInsight(DIAG)与 gNB 日志从模组侧、网络侧交叉验证,
+形成三源互证的完整复现链路。
 
-## Hook design (verified against Linux 6.8 sources)
+测试床:ocudu gNB(USRP X310,n78 TDD 20 MHz,PLMN 001-01)+ open5gs
+(host 或 docker 均可),UE 在 `robot@192.168.5.2`(Ubuntu 22.04,
+kernel 6.8.0-134),UE IP `10.45.1.2/30`,网关 `10.45.1.1`。
 
-`drivers/net/usb/usbnet.c` @ v6.8:
-
-- **enqueue** = `usbnet_start_xmit(struct sk_buff *skb, struct net_device *net)`
-  — the `ndo_start_xmit` of every usbnet minidriver. `qmi_wwan` sets
-  `.ndo_start_xmit = usbnet_start_xmit` and, importantly, **has no
-  `tx_fixup` in 6.8**, so the `skb` pointer seen at function entry is exactly
-  the pointer handed to the URB below.
-- **dequeue** = `static void tx_complete(struct urb *urb)` — the TX URB
-  completion callback. The skb is recovered from `urb->context`:
-  `usb_fill_bulk_urb(urb, dev->udev, dev->out, skb->data, skb->len,
-  tx_complete, skb)`; `tx_complete` starts with
-  `struct sk_buff *skb = (struct sk_buff *) urb->context;`.
-- **dwell time** = `tx_complete` entry − `usbnet_start_xmit` entry, correlated
-  per skb pointer. **Queue length** = in-flight count (enqueue +1 /
-  completion −1), also kept in bytes.
-
-Attach method: `tx_complete` is a generic name (other modules have their
-own), so both probes are attached **by address** with libbpf
-`bpf_program__attach_kprobe_multi_opts()` (`opts.addrs`), after resolving
-`usbnet_start_xmit [usbnet]` / `tx_complete [usbnet]` in `/proc/kallsyms`
-(root required). Never attach by name.
-
-`struct urb` note: on the target (Ubuntu 22.04, kernel 6.8.0-134-generic)
-usbcore is built into vmlinux — there is **no** `/sys/kernel/btf/usbcore` —
-so `struct urb` is in the vmlinux BTF and CO-RE reads of `urb->context`
-work with the plain generated `vmlinux.h`.
-
-Known behaviors / caveats:
-
-- If the device is runtime-suspended (`EVENT_DEV_ASLEEP`), usbnet anchors
-  the URB (`usb_anchor_urb(&dev->deferred)`) and submits it at resume; dwell
-  then legitimately includes the sleep. Rare under load.
-- If `usb_submit_urb()` fails synchronously, the skb is freed without a
-  completion; that entry leaks in `skb_map` and inflight stays +1. This
-  essentially does not happen in steady state; watch the counters.
-- TX completions via `usb_unlink_urb()` (tx timeout, halt, disconnect)
-  still run `tx_complete`, so they are accounted.
-- Skbs already in flight when the tool starts have no enqueue record;
-  their completions bump the `miss` counter once.
-- Drivers *with* a `tx_fixup` (e.g. cdc_ncm) may replace the skb after our
-  enqueue probe; those would show up as `miss`. Not the case for qmi_wwan.
-
-## Files
-
-- `src/txdwell.bpf.c` — BPF side: kprobes, skb hash, ringbuf (256 KB),
-  config map, atomic stats counters (in-flight pkts/bytes, totals, misses).
-- `src/txdwell.c` — userspace loader: kallsyms resolution, kprobe_multi
-  attach by address, ringbuf → CSV, 1 s `STATS` lines, SIGINT summary.
-- `src/txdwell.h` — shared event/config/stat definitions.
-- `Makefile` — builds `vmlinux.h` (bpftool BTF dump), the BPF object
-  (clang `-target bpf`, CO-RE) and the loader (static libbpf).
-- `scripts/setup_robot.sh` — idempotent robot setup: apt deps
-  (clang, libelf-dev, zlib1g-dev), libbpf v1.4.5 source build into
-  `~/libbpf`, `vmlinux.h`, `make`.
-- `scripts/record.sh` — timed recording to CSV (runs on the robot).
-- `scripts/plot.py` — dwell time + in-flight depth over time from a CSV
-  (Aether Fig. 4a style). Runs locally; robot needs no python.
-
-## Build (on the robot)
-
-```sh
-git clone <this repo> ~/usbnet-ebpf        # or rsync it over
-cd ~/usbnet-ebpf
-./scripts/setup_robot.sh                   # sudo password if asked
-```
-
-The Makefile expects libbpf at `../libbpf` (matches `~/libbpf` when the
-repo is `~/usbnet-ebpf`); override with `make LIBBPF_DIR=/path/to/libbpf`.
-The system libbpf (0.5.0) is too old and is not used.
-
-## Run (on the robot, root)
-
-```sh
-sudo ./txdwell                    # all usbnet ifaces, DEQ + STATS, stdout
-sudo ./txdwell -i wwan0 -v        # filter interface, also emit ENQ events
-sudo ./txdwell -d 60 -o run.csv   # timed recording to file
-./scripts/record.sh 60 data/run1.csv -i wwan0
-```
-
-CSV columns:
+## 复现链路(三个证据源)
 
 ```
-ENQ,ts_ns,ifindex,len,0,inflight
-DEQ,ts_ns,ifindex,len,dwell_ns,inflight
-STATS,ts_ns,inflight_pkts,inflight_bytes,enq_total,deq_total,miss,insert_fail,rb_lost
+            UE (robot)                                   network
+ ┌──────────────────────────────┐
+ │ app → qdisc → usbnet → USB → │      ┌─────────────┐     ┌────────┐
+ │                ▲             │      │ RM500Q 内部  │     │ ocudu  │
+ │   ① txdwell (eBPF kprobes)   │      │ UL buffer   │────▶│ gNB    │
+ │   usbnet_start_xmit          │      │  ②DIAG:     │ air │ ③MAC 日志│
+ │   tx_complete                │      │  0xB883 TB  │     │ SBSR   │
+ │   → dwell + in-flight        │      │  0xB873 BSR │     │        │
+ └──────────────────────────────┘      └─────────────┘     └────────┘
 ```
 
-`ts_ns` is `CLOCK_MONOTONIC` (same clock as `bpf_ktime_get_ns`).
+- **① driver 侧(eBPF)**:enqueue = `usbnet_start_xmit`(qmi_wwan 在 6.8
+  无 `tx_fixup`,skb 指针无损),dequeue = `tx_complete`(`urb->context`
+  关联 skb)。`tx_complete` 是通用名,**必须按地址挂载**:`/proc/kallsyms`
+  中带 `[usbnet]` 后缀的符号 + libbpf kprobe_multi(`opts.addrs`)。
+  dwell = 两探针时间戳之差;in-flight = 在飞 skb 计数。
+- **② 模组侧(DIAG/MobileInsight)**:robot 上
+  `~/Documents/mobileinsight-core`(venv)经 `/dev/ttyUSB0` 采集:
+  - `5G_NR_MAC_UL_Physical_Channel_Schedule_Report` (**0xB883**):
+    逐 TB 空口事件。v2.11 记录格式自带解码器解不出(只给 Raw Hex),
+    本仓库 `scripts/decode_b883.py` 负责解码(布局与位打包见 docstring,
+    已经多重校验:RNTI 恒定、slot∈[0,20)@30 kHz、num_rbs=51=满 20 MHz
+    载波、TB size 吻合流量、retx 占比 ≈ gNB 侧 NOK)。
+  - `5G_NR_L2_UL_BSR` (**0xB873**):**UE 侧 BSR**——逐 TTI 的触发原因
+    (HIGH_DATA_ARRIVAL/周期)、SHORT/LONG、逐 LCG BSR index(与 gNB
+    SBSR 同标度)。
+  - `5G_NR_MAC_UL_TB_Stats` (0xB881,累计计数)、`5G_NR_LL1_FW_Serving_FTL`。
+- **③ gNB 侧**:ocudu MAC 日志逐条解 UE 上报的
+  `SBSR: lcg=0 bs=N`(docker 部署时完整日志在容器卷
+  `/tmp/gnb_ocudu_x300.log`,`docker logs` 只是子集)。
 
-Then locally: `python3 scripts/plot.py data/run1.csv`.
+**时间对齐**:txdwell 用 `CLOCK_MONOTONIC` ns;mi2log 解码字典里的
+`timestamp` 是 datetime(UTC)。用在 robot 上采的
+`time.monotonic_ns()` ↔ `time.time_ns()` 偏移换算(同次开机有效;
+注意 `/proc/uptime` 含休眠时间,不等于 monotonic)。
+回放时的 `msg.timestamp` 是回放时刻,**不要**用作时间轴。
 
-## Status
+## 主要结果(与论文对照)
 
-Validated on the robot (kernel 6.8.0-134-generic, 2026-07-30):
+| 论文观测 | 本复现(RM500Q) | 判定 |
+|---|---|---|
+| Obs 2:dequeue 时机 = 模组消费时机,dwell 是"空口子 RTT" | 空闲 dwell 0.02–0.15 ms;有会话时单包 ~6.9 ms,12 µs 间隔两包完成间隔 6.95 ms、后者 dwell ~13.9 ms(教科书 FIFO,消费节奏=UL grant 周期) | 一致 |
+| Obs 3:driver 队列与模组缓冲"单一逻辑队列",Fig. 4b R=0.96 | **corr(driver 消费速率, 模组逐 TB 空口速率) R=0.964**;字节闭环 air/DEQ=1.015(TB 含协议开销);BSR 顶格 ↔ driver 队列顶满 ↔ dwell 平台,同起同落 | 一致(关键结论) |
+| Fig. 2c:拥塞时 cwnd 滞后 1.6 s 才降 | 更强:**cwnd 全程不降**(20+ s 严重拥塞,CUBIC 240→575 还涨)——深缓冲让 ACK 系 CCA 完全无感 | 一致且更极端 |
+| §4.3:USB 的 skb_buffer 最大 4(PCIe 128) | 实测 6.8 usbnet in-flight 上限 **~64** | 参数差异(版本相关,不影响 dwell 法) |
+| (隐含)driver dwell ≈ 空口排队全部 | RM500Q 内部 UL 缓冲很深:RTT ~850 ms 时 driver dwell 仅 ~190 ms——**driver dwell 是空口排队下界** | 定量差异(值得注意) |
 
-- Build OK (clang 14 + libbpf v1.4.5 static, CO-RE against vmlinux BTF).
-- Both kprobes attach **by address** via kprobe_multi; no verifier errors.
-- No traffic → counters all zero, as expected. (fprobe-based attaches do
-  not create tracefs kprobe events, so `/sys/kernel/tracing/kprobe_profile`
-  does not list them; use the STATS counters as the hit indicator.)
-- RM500Q present (`2c7c:0800`, qmi_wwan bound, `wwan0`), but NetworkManager
-  is stuck in `connecting (prepare)` — **no data session**, and without one
-  the modem does not service the bulk-OUT endpoint, so submitted URBs just
-  sit pending (observed: ENQ without DEQ, inflight grows).
-- ENQ path validated with real packets on `wwan0` (NM control traffic):
-  ifindex filter works, lengths/inflight tracked.
-- DEQ path validated via the unlink flush on `ip link set wwan0 down`:
-  every pending URB completes through `tx_complete` (-ECONNRESET), dwell
-  times matched each packet's exact queue residency (max 4.21 s),
-  `urb->context` correlation 5/5, inflight drained 4→3→2→1→0. Pre-observer
-  in-flight skbs correctly accounted as `miss`.
+另外观测到的模组行为细节:过载时 dwell **双峰**(~2.25 ms 快路径
+vs ~180–205 ms 窄带),窄带是模组 USB 流控的时间尺度,直接暴露在
+driver dwell 分布里。
 
-### Data session blocker (diagnosed 2026-07-30)
+## 实测数字汇总
 
-The modem cannot register to any network in its current environment:
+**(a) 端到端吞吐(UE→10.45.1.1)**
 
-- SIM is a **test SIM**: IMSI `001011234567895` → home PLMN **001-01**
-  (the test PLMN the private base station must broadcast).
-- Full band scan (`AT+COPS=?`) sees only Hong Kong commercial networks
-  (CMHK 454-12, CSL 454-00/454-19, "3" 454-03, SmarTone 454-06), all
-  reported **forbidden** for this SIM; serving cell `LIMSRV`
-  (emergency-only). PLMN 001-01 is **not on air** → private base station
-  is off or out of range.
-- `qmicli --wds-start-network="apn='internet',ip-type=4"` →
-  `CallFailed, call end reason: generic-no-service ([cm] no-service)`.
-- Conclusion: dwell-time curves under real uplink load require the
-  private base station (PLMN 001-01) to be powered on first. Everything
-  else (tool chain, ENQ/DEQ correlation, dwell math, CSV/plot) is ready
-  and validated.
+| 指标 | 数值 | 说明 |
+|---|---|---|
+| TCP 上行 goodput | 发送端 3.0–5.1 Mbps,接收端 2.4–3.7 Mbps | iperf3 3.19.1,8–45 s 多次 |
+| UDP 上行(不超容量) | 9.0 Mbps 全程无损 | 单发 ~1100 pkt/s × 1 KB |
+| 空口 UL 容量(实测) | ~5.5 Mbps(8-01 多次)– ~10.5 Mbps(8-02) | 同一小区不同时段;由 0xB883 逐 TB 速率直接读出 |
+| ping RTT | 空闲 28–47 ms;TCP 加载后最高 ~850 ms | bufferbloat 全在模组侧 |
+| UL 空口重传率 | ~3.4 %(逐 TB 统计) | 与 gNB 侧 UL NOK 一致 |
 
-Host changes made during bring-up (robot): `libqmi-utils` installed via
-apt; ModemManager service restarted; wwan0 brought up/down during tests
-(restored to DOWN, no IP); no routes touched (default stays on wlo1,
-192.168.5.0/24 on enp100s0).
+**(b) 队列各层(driver/模组,过载工况 `data/overload.*`)**
 
-## Bring-up checklist for a real data session
+| 层 | 行为 |
+|---|---|
+| driver in-flight | 顶格 ~64 包(p50=40),6.8 usbnet 上限 |
+| driver dwell | p50=2.41 ms,p90=177 ms,p99=190 ms(双峰) |
+| driver 消费速率 vs 模组空口速率 | **R=0.964**;字节闭环 air/DEQ=1.015 |
+| UE BSR(两端) | 97% 顶格 31(>150 KB),空闲为 0;中间值只在过渡瞬间 |
+| 模组内部缓冲深度 | RTT(~850 ms)− driver dwell(~190 ms)⇒ 模组内部还压着数百毫秒 |
 
-1. Power on the private base station broadcasting PLMN **001-01** (the
-   test SIM's home network; commercial HK networks reject this SIM).
-   Confirm with `mmcli -m 0` → state `registered`, or
-   `AT+COPS?` → `+COPS: 0,2,"00101"` / `AT+CEREG?` → `0,1`.
-2. Establish the session: NetworkManager/ModemManager
-   (`nmcli connection up internet`), or
-   `qmicli -d /dev/cdc-wdm0 --wds-start-network="apn='internet',ip-type=4" --client-no-release-cid`
-   then `--wds-get-current-settings` and configure wwan0 accordingly
-   (set `raw_ip` first if needed, interface must be down to change it).
-2. Start observer: `sudo ./txdwell -i wwan0 -v -d 60 -o /tmp/t.csv`
-   (or `./scripts/record.sh 60 data/run1.csv -i wwan0`).
-3. Generate uplink traffic: `ping -I wwan0 <gw>` or iperf3 uplink.
-4. Check the `summary:` line: `miss` ~0, `enq ≈ deq + inflight`.
-5. Copy CSV back, `python3 scripts/plot.py data/run1.csv` for the
-   Fig. 4a-style dwell / queue-length curves.
+**(c) 队列各层(不超容量工况 `data/aligned.*`)**:dwell p50=0.09 ms、
+p99=0.2 ms、in-flight≈0、BSR 24–31 中间值跟随、R=0.943、
+goodput 9.03 Mbps 无损。
 
-## Experimental results (2026-07-31, private 5G on air)
-
-Setup: ocudu gNB (USRP X310, n78 TDD 20 MHz) + open5gs on the gNB host
-(`~/Documents/ocudu/start_host.sh`), UE = RM500Q on the robot,
-PLMN 001-01, UE IP `10.45.1.2/30`, gateway `10.45.1.1`. Traffic:
-`udp_seq_sender.py` (1000 B datagrams) and iperf3 from the UE.
-
-Observed with txdwell on `wwan0` (healthy modem, `data/run3.csv` +
-live probes):
-
-- **Idle baseline**: dwell ≈ 0.02–0.15 ms, in-flight 0 — the modem
-  consumes packets immediately, no driver queue.
-- **Grant-cycle regime**: with a live session the modem services the
-  bulk-OUT endpoint roughly once per UL scheduling cycle: single packets
-  show dwell ≈ 6.9 ms; two packets 12 µs apart complete ~6.95 ms apart
-  and the second shows dwell ≈ 13.9 ms — textbook FIFO: driver queue
-  dwell time directly exposes the modem's consumption (grant) timing,
-  which is Aether's Observation 2/3 on the USB host interface.
-- **Sustained overload** (`data/run5.csv`, `data/run5.png`): 10 Mbps UDP
-  flood → dwell jumps from ~0.02 ms to a 200–680 ms sawtooth, in-flight
-  oscillates ~30–90 packets for the whole flood. The queue sawtooth is
-  the driver queue repeatedly draining/refilling under modem
-  backpressure — the Fig. 4a shape, here driven extreme because the
-  modem's data path stalled (see below).
-
-### RM500Q data-path instability — ROOT-CAUSED AND FIXED (2026-07-31)
-
-Root cause: **USB 10 Gbps (SuperSpeedPlus, Gen 2) link instability**
-between the RM500Q and the robot's Intel Alder Lake PCH xHCI. At 10 Gbps
-any sustained bulk-OUT burst triggers -EPROTO (`Unexpected error -71`)
-within ~1 s; the modem keeps consuming errored URBs but drops them
-internally (gNB sees BSR=0 + padding). Ruled out: thermals
-(AT+QTEMP = 26–31 °C at wedge), RF signal (RSRP −81 dBm / SINR ~28 dB),
-autosuspend/LPM (off; xHCI already refuses U1/U2), raw_ip/WDA settings,
-RAN deployment mode (identical on host and docker gNB).
-
-Fix (persistent in modem NVRAM, applied 2026-07-31):
+## 端到端链路逐段分析
 
 ```
-AT+QCFG="usbspeed","20"      # was "30"; forces USB 2.0 High-Speed (480 Mbps)
-AT+CFUN=1,1                  # reboot module to apply
+app udp_seq_sender/iperf3  ── 供给 9.0–14 Mbps(UDP)/ 2.4–5 Mbps(TCP)
+  │
+qdisc(fq_codel, qlen 1000)── 仅当 driver 满才丢(过载时 ~11.5k 包根本没进驱动)
+  │
+usbnet driver queue        ── in-flight ≤64;不超容量 dwell ~0.1 ms,
+  │(URB 提交→tx_complete)     超容量双峰 2.4 ms / ~190 ms(流控时间尺度)
+  │
+USB bulk-OUT 服务           ── 空闲即时;低速时 ~6.9 ms/包的 grant 周期;
+  │                          满载 ~830–1250 URB/s(≈7–10 Mbps)
+  │
+modem 内部 UL 缓冲           ── SDAP/PDCP/RLC,深:>150 KB 且开关式
+  │(对 host 不可见,仅 BSR     (0↔31);TCP 下能藏 ~600 ms 排队
+  │  与 0xB883 可见)
+  │
+空口 UL(PUSCH)            ── 容量 ~5.5–10.5 Mbps(随无线环境);
+  │                          retx ~3.4%;MCS 7–13,51 RB×14 sym 满载波
+  │
+gNB→UPF→ogstun(GTP-U)    ── 无可观测附加排队;RTT 构成证明队列几乎全在模组
 ```
 
-Afterwards the modem enumerates on the USB2 hub (`3-1`, speed 480) and
-the wedge is **gone**: 10 Mbps sustained flood = 30049/30049 URBs
-completed, zero TX errors, ping healthy throughout. 480 Mbps is ~10×
-above what this 20 MHz n78 cell can do; no practical throughput loss.
-Revert with `AT+QCFG="usbspeed","30"` + `AT+CFUN=1,1` (MM stopped).
-For a hardware-level cure at 10 Gbps (cable/connector retest), the
-previous instability notes were: recovery needed a USB re-enumeration
-(`echo 4-1 > /sys/bus/usb/drivers/usb/{unbind,bind}` with MM stopped);
-a QMI `--wds-reset` alone was not sufficient.
+RTT 分解(过载):e2e RTT ~850 ms ≈ driver dwell ~190 ms + 模组内部
+~600 ms + 空口/回传 ~30–50 ms。**排队瓶颈的主体在模组内部,driver
+队列是它的溢出阀**——这正是论文"单一逻辑队列"的物理图景,但在
+RM500Q 上两段的"容积比"和论文测试的 USB 模组(浅缓冲)不同。
 
-### Results after the fix (physiological regimes, 2026-07-31)
+## 与论文机制的深入对照
 
-- `data/run8.csv` — 10 Mbps single-sender flood (real rate ~6.8 Mbps ≈
-  cell UL capacity): dwell p50 ~0.14 ms, p99 ~182 ms, queue stays
-  shallow; effective consumption ~830 URB/s ≈ 6.8 Mbps goodput.
-- `data/run10.csv` — dual-sender ~13 Mbps (above capacity): sustained
-  queue, in-flight oscillating ~15–64, dwell strongly **bimodal**:
-  ~2.25 ms median fast path vs a tight **~180–205 ms slow band**. The
-  200 ms band is a modem-internal flow-control timescale exposed
-  directly in the driver queue dwell distribution — another instance of
-  the paper's core claim (modem behavior legible in driver queuing).
-  Offered-minus-consumed excess dropped at the qdisc (~11.5k packets
-  never entered the driver): backpressure propagated correctly.
+- **§4.3 为什么选 dwell 而不是队长**:我们的数据直接背书——队长是
+  开关式的(in-flight 0 或顶格 64、BSR 0 或 31),几乎不含梯度信息;
+  dwell 连续可变(0.02 ms→190 ms,跨 4 个数量级),是唯一可用的
+  拥塞度量。
+- **§4.4 瓶颈检测器**:dwell 突增=上行瓶颈成立的证据(加压同秒内
+  起跳);停压即落可判定瓶颈转移。逻辑上直接可用。
+- **§4.5 Little's law 容量估计(Cu = γ·Q/D)**:在 RM500Q 上**不能
+  直接套 driver 段的 Q/D**——usbnet 是多 URB 并行+流控的非单一
+  FIFO,且 dwell 双峰:用快路径(64×1028 B/2.4 ms ≈ 27 Mbps)高估,
+  用慢路径(64×1028 B/190 ms ≈ 2.8 Mbps)低估,真值 ~10 Mbps 在
+  两者之间。论文的估计器成立的前提是"driver 队列=瓶颈队列本体",
+  而本机瓶颈主体在模组内部。要用 §4.5,应改用 BSR(模组内部占位)
+  或快路径 dwell 的统计下沿——这是把 Aether 移植到深缓冲 USB 模组
+  上需要修正的点。
+- **部署方式(方法论差异)**:论文是改驱动 + EXPORT_SYMBOL + 内核
+  模块;本复现用**纯 eBPF kprobe(按地址挂载),零内核改动**,拿到
+  同样的观测。对"不改固件/驱动"的论点构成加强。
+- **主要定量差异**:USB 队列上限(64 vs 论文 4)、模组内部深缓冲
+  (driver dwell 是空口排队下界,论文 USB 模组是浅缓冲近似相等)。
+  两者都不动摇 dwell 作为信号的有效性,但影响用它做定量估计的方式。
 
-Traffic note: iperf3 3.9's server crashes per-test here
-(`select failed: Bad file descriptor`); the repo-free
-`udp_seq_sender.py` / `udp_seq_server.py` pair (from
-`~/Documents/ocudu/scripts/`, copied to the robot as `~/udp_seq_sender.py`)
-is the reliable load generator.
+**标准数据集**(`data/`,采集窗口已对齐:DIAG 68 s ⊇ txdwell 60 s):
 
-Local (gNB host) changes this session: temporary NOPASSWD sudoers entry
-(removed after gNB start), gNB + supervised iperf3 server left running.
-Robot changes this session: ModemManager restarts, one QMI `--wds-reset`,
-two USB re-enumerations of the modem, `udp_seq_sender.py` copied to
-`~`. txdwell sources + binary in `~/usbnet-ebpf`.
+- `aligned.*` — 低于容量(供给 ~9 Mbps < 空口 ~10 Mbps):队列全
+  程很薄(dwell ~1–3 ms、in-flight≈0),BSR 在 24–31 跟随,R=0.943。
+- `overload.*` — 超容量(双发 ~14 Mbps):BSR 两端顶格 31、
+  in-flight 顶格 64、dwell 150–200 ms 带、结束各层同步排空,
+  **R=0.964**,air/DEQ=1.015。
+- 队列填充的因果链(过载每次复现):加压 → **UE BSR 先动**(0xB873
+  触发 HIGH_DATA_ARRIVAL,~1 s 内 0→31)→ gNB 见 bs=31 → **USB 流控
+  反压,driver 队列顶满**(in-flight→64)→ dwell 抬升 → 空口顶到
+  容量平台 → 停压各层一起排空。
 
-### Follow-up runs (docker gNB + rate ladder, 2026-07-31)
+## RM500Q USB 稳定性
 
-- **Docker gNB vs host gNB**: identical dwell signatures (`data/run6.csv`,
-  median 426 ms vs 415 ms host). The wedge is modem-side, independent of
-  RAN deployment mode.
-- **Rate ladder** (`data/run7.csv`, 2 → 4 → 8 Mbps in one recording):
-  the modem wedged **already at 2 Mbps** — dwell went 0.14 ms → 311 ms
-  within the first second of load; all subsequent rates show the same
-  wedged regime: effective USB service rate ~143 URB/s (~1.1 Mbps goodput
-  ceiling), dwell ~420 ms median (max ~1 s), in-flight oscillating 30–90.
-  No self-recovery after load stops (still wedged after 14 s drain).
-- Healthy-regime reference (from probes on 2026-07-31): at ping-level
-  rates the modem sustains indefinitely with grant-cycle dwell ~6.9 ms.
-  The physiological multi-Mbps regime (dwell ~7–50 ms under real air
-  backpressure) is **not reachable on this unit** until the USB data-path
-  instability is fixed — the wedge onset sits between ~1 pkt/s and
-  250 pkt/s sustained.
-- Interpretation vs the paper: the driver-queue signal tracks modem
-  backpressure faithfully across 4 orders of magnitude (0.02 ms idle →
-  ~7 ms grant-cycle → ~400+ ms congestion/stall), which is exactly the
-  property Aether relies on for its bottleneck detector (§4.4: dwell
-  spike = uplink bottleneck).
+这颗 RM500Q 在 **USB 10 Gbps(SSP Gen2)** 链路上不稳定:任何持续
+bulk-OUT 突发在秒级内触发 `-EPROTO`(`qmi_wwan: Unexpected error -71`),
+模组吞包但不上空口(gNB 只见 BSR=0+padding),只有 USB 重新枚举能恢复。
+已排除:过热(AT+QTEMP 26–31 °C)、信号(RSRP −81 dBm/SINR ~28 dB)、
+LPM(xHCI 本就拒绝 U1/U2)、RAN 部署方式(host/docker 同样复现)。
 
-## Cross-validation vs the paper (2026-08-01, docker gNB, USB2 mode)
+**修复(已写入模组 NVRAM,重启保持)**:
 
-iperf3 fixed: built 3.19.1 static (`--without-openssl --enable-static-bin`),
-deployed as `~/iperf3.new` (robot) and `/usr/local/bin/iperf3.new`
-(open5gs_5gc container). Stock 3.9's per-test server crash is gone; TCP UL
-≈3 Mbps / UDP fine. Use it for all iperf3 work here.
+```
+AT+QCFG="usbspeed","20"     # 强制 USB 2.0 High-Speed(480 Mbps)
+AT+CFUN=1,1                 # 重启模组生效;回退: "30" + 同样重启
+```
 
-run12 (TCP UL + 8 s UDP injection, `data/run12.csv` + `data/cwnd12.log`,
-plot `data/run12_cc.png`):
+修复后 10 Mbps 持续冲击 30049/30049 URB 完成、零错误。480 Mbps 相对
+20 MHz 小区无瓶颈。固件 RM500QGLABR13A02M4G(R13A02,较旧)。
 
-- Driver dwell: 0.2 ms → ~190 ms plateau within ~2–3 s of the congestion
-  event, back to ~0.2 ms after it drains. Instant response confirmed.
-- **TCP cwnd never decreased** through 20+ s of severe congestion
-  (CUBIC plateaued at ~240 segs, later grew to 575): the deep buffers
-  hide loss entirely, so the ACK-based CCA is not 1.6 s late (paper's
-  Fig. 2c case) but *completely oblivious* here — strengthens the
-  paper's motivation.
-- RTT reached ~850 ms while driver dwell plateaued at ~190 ms → on the
-  RM500Q the modem-internal UL buffer holds several hundred ms of data
-  below the URB-completion point. Driver dwell is a *lower bound* of
-  air-side queuing on this modem, unlike the paper's USB modem whose
-  driver queue ≡ modem queue ("single logical queue", max 4 skbs).
+## 仓库结构
 
-run15 (10 Mbps UDP flood + concurrent DIAG capture, `data/run15.csv` +
-`data/run15_tb.csv`, plot `data/run15_joint.png`):
+- `src/txdwell.bpf.c` — BPF 侧:两个 kprobe(kprobe.multi SEC)、
+  skb hash、ringbuf、配置 map(ifindex 过滤/ENQ 开关)、统计 counters。
+- `src/txdwell.c` — 用户态 loader:kallsyms 解析 `[usbnet]` 符号地址、
+  kprobe_multi 按地址挂载、ringbuf→CSV、1 s STATS、SIGINT 汇总。
+- `src/txdwell.h` — 共享事件/配置定义。
+- `Makefile` — 生成 `vmlinux.h`(bpftool;目标机 usbcore 内建于
+  vmlinux,`struct urb` 可直接 CO-RE)、clang `-target bpf`、静态
+  libbpf(`LIBBPF_DIR ?= ../libbpf`,v1.4.5;系统 0.5.0 太旧)。
+- `scripts/setup_robot.sh` — robot 一键幂等装依赖+libbpf+构建。
+- `scripts/record.sh` — 定时录制 CSV。
+- `scripts/plot.py` — dwell + in-flight 曲线(Fig. 4a 风格)。
+- `scripts/decode_b883.py` — 0xB883 v2.11 Raw Hex → 逐 PUSCH TB CSV。
+- `data/` — 标准对齐数据集(`aligned.*`、`overload.*`)。
+- robot 侧采集/分析脚本在 robot 仓库
+  `~/Documents/mobileinsight-core/bsr_exp/`(capture_ue_bsr.py、
+  mi_extract_ue_bsr.py、mi_b883_raw.py、mi_dump.py)。
+- 论文原文:`sigcomm26-final420(2).pdf`、`paper.txt`。
 
-- MobileInsight OnlineMonitor on `/dev/ttyUSB0` (DIAG), log types
-  `5G_NR_MAC_UL_TB_Stats` (0xB881, 5 ms cadence cumulative counters) +
-  `5G_NR_LL1_FW_Serving_FTL`. Per-bin modem air UL rate from
-  `TB New Tx Bytes` deltas tracks the driver DEQ rate through ramp and
-  plateau (~5.5 Mbps cell UL capacity): **R = 0.81** over loaded 0.5 s
-  bins — direct modem-side confirmation that the driver queue mirrors
-  modem service dynamics (the paper's Observation 3).
-- Time alignment: txdwell ts = CLOCK_MONOTONIC ns; mi2log decoded dict
-  `timestamp` is a datetime (UTC). Convert with a per-boot offset
-  (sample `/proc/uptime` + `date -u` on the robot). NOTE: replayed
-  `msg.timestamp` is replay-time, useless; always use the dict field.
-- DIAG capture gotchas: stopping ModemManager makes NM remove wwan0's
-  IP/routes — re-apply `ip addr replace 10.45.1.2/30 dev wwan0` +
-  `ip route replace 10.45.1.0/30 dev wwan0 scope link` before sending
-  traffic, or it silently egresses via WiFi. `0xB883`
-  (UL_Physical_Channel_Schedule_Report, would carry BSR) decodes as
-  `Records: null` with only Raw Hex on this firmware (v2.11 record
-  format unsupported by the bundled decoder) — BSR path left as future
-  work (decode Raw Hex or QLog).
+## 复现步骤
+
+1. 基站: `cd ~/Documents/ocudu && ./start_docker.sh`(或
+   `WITH_IPERF=1 ./start_host.sh`);确认 UE 注册、ping 10.45.1.1 通。
+2. robot 构建: `cd ~/usbnet-ebpf && ./scripts/setup_robot.sh`。
+3. 观测: `sudo ./txdwell -i wwan0 -d 60 -o /tmp/run.csv`
+   (CSV: `DEQ,ts_ns,ifindex,len,dwell_ns,inflight`,ts 为
+   CLOCK_MONOTONIC ns)。
+4. 模组侧(与 3 同时):停 ModemManager(**注意:NM 会随之删除
+   wwan0 的 IP/路由,必须手工补回**,否则流量静默走 WiFi):
+   ```
+   systemctl stop ModemManager && chmod 666 /dev/ttyUSB0
+   ip addr replace 10.45.1.2/30 dev wwan0 && ip link set wwan0 up mtu 1400
+   ip route replace 10.45.1.0/30 dev wwan0 scope link
+   timeout 68 ~/Documents/mobileinsight-core/venv/bin/python \
+     ~/Documents/mobileinsight-core/bsr_exp/capture_ue_bsr.py \
+     /dev/ttyUSB0 115200 /tmp/run.mi2log
+   ```
+   发压用 `~/Documents/udp_seq_sender.py`(iperf3 3.9 在此环境每测必
+   崩;如需 iperf3 用编好的 3.19.1 静态版)。
+5. 分析:robot 上用 `bsr_exp/` 的提取脚本出 UE BSR / 0xB883 raw;
+   本地 `scripts/decode_b883.py` 解逐 TB 事件,`scripts/plot.py`
+   或对齐出图脚本出曲线;时钟偏移在 robot 上
+   `python3 -c 'import time; print(time.monotonic_ns(), time.time_ns())'`
+   采样换算。
+
+## 已知坑(都踩过)
+
+- 停 ModemManager → NM 删 wwan0 路由(见上)。
+- iperf3 3.9 server `select failed: Bad file descriptor`(每测必崩
+  退出)→ 用 3.19.1 静态版。
+- `ss -tin dst <gw>` 会同时匹配 iperf 控制连接和数据连接,采 cwnd
+  要按本地端口区分。
+- DIAG 采集窗口要 ≥ txdwell 窗口,否则空口序列"断头"(曾误判为
+  模组停发,gNB PUSCH 日志证伪)。
+- kprobe_multi 走 fprobe,`/sys/kernel/tracing/kprobe_profile` 不显示
+  命中,以 STATS 计数为准。
