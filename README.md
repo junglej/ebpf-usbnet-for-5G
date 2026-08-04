@@ -74,7 +74,7 @@ driver dwell 分布里。
 | TCP 上行 goodput | 发送端 3.0–5.1 Mbps,接收端 2.4–3.7 Mbps | iperf3 3.19.1,8–45 s 多次 |
 | UDP 上行(不超容量) | 9.0 Mbps 全程无损 | 单发 ~1100 pkt/s × 1 KB |
 | 空口 UL 容量(实测) | ~5.5 Mbps(8-01 多次)– ~10.5 Mbps(8-02) | 同一小区不同时段;由 0xB883 逐 TB 速率直接读出 |
-| ping RTT | 空闲 28–47 ms;TCP 加载后最高 ~850 ms | bufferbloat 全在模组侧 |
+| ping RTT | 空闲 28–47 ms;TCP 加载后 ~500–640 ms(`ss` 采样),峰值 ~850 ms | TCP 下排队几乎全在模组内部缓冲(driver dwell ~0.1 ms);UDP 过载时 driver 队列另承担 ~190 ms(溢出阀) |
 | UL 空口重传率 | ~3.4 %(逐 TB 统计) | 与 gNB 侧 UL NOK 一致 |
 
 **(b) 队列各层(driver/模组,过载工况 `data/overload.*`)**
